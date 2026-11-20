@@ -11,10 +11,28 @@ FRONTEND = ROOT / "frontend"
 SESSIONS: dict[str, str] = {}
 
 def connect():
+    """返回 (conn, writable)。只读库时 writable=False，读端点照常、写端点显式拒绝。"""
     DATA.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     conn.row_factory = sqlite3.Row
-    return conn
+    conn.execute("PRAGMA busy_timeout=3000")
+    writable = True
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        writable = False
+    if writable:
+        import batch_remap
+        try:
+            batch_remap.ensure_batch_tables(conn)
+        except sqlite3.OperationalError:
+            writable = False
+    return conn, writable
+
+
+def require_writable(writable: bool):
+    if not writable:
+        raise HTTPException(503, "数据库只读，批重映写操作不可用")
 
 def sha(p: str) -> str:
     return hashlib.sha256(p.encode("utf-8")).hexdigest()
@@ -51,7 +69,11 @@ app = FastAPI(title=PRODUCT)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 def init_db():
-    with connect() as conn:
+    conn, writable = connect()
+    if not writable:
+        conn.close()
+        return
+    with conn:
         ensure_users(conn)
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS map_versions(
@@ -81,6 +103,8 @@ def init_db():
           status TEXT NOT NULL
         );
         """)
+        import batch_remap
+        batch_remap.ensure_batch_tables(conn)
         if conn.execute("SELECT COUNT(*) c FROM map_versions").fetchone()["c"] == 0:
             conn.execute("INSERT INTO map_versions(version,status,effective_from) VALUES (?,?,?)", ("m-2026.11","生效","2026-11-01"))
             conn.executemany("INSERT INTO mappings(version,old_key,new_key,kind) VALUES (?,?,?,?)", [
@@ -97,13 +121,15 @@ def _s(): init_db()
 
 @app.get("/api/health")
 def health():
-    with connect() as c:
+    c, _writable = connect()
+    with c:
         n = c.execute("SELECT COUNT(*) c FROM mappings").fetchone()["c"]
     return {"ok": True, "product": PRODUCT, "skeleton": SKELETON, "mappings": n, "db": str(DB_PATH)}
 
 @app.post("/api/login")
 def login(body: LoginIn):
-    with connect() as c:
+    c, _writable = connect()
+    with c:
         row = c.execute("SELECT username,role FROM users WHERE username=? AND password_sha=?", (body.username, sha(body.password))).fetchone()
     if not row: raise HTTPException(401, "账号或密码错误")
     tok = secrets.token_hex(16); SESSIONS[tok]=row["username"]
@@ -112,13 +138,15 @@ def login(body: LoginIn):
 @app.get("/api/map-versions")
 def versions(authorization: str | None = Header(default=None)):
     require_user(authorization)
-    with connect() as c:
+    c, _writable = connect()
+    with c:
         return {"items":[dict(r) for r in c.execute("SELECT * FROM map_versions ORDER BY id").fetchall()]}
 
 @app.get("/api/mappings")
 def mappings(authorization: str | None = Header(default=None)):
     require_user(authorization)
-    with connect() as c:
+    c, _writable = connect()
+    with c:
         return {"items":[dict(r) for r in c.execute("SELECT * FROM mappings ORDER BY id").fetchall()]}
 
 class RemapIn(BaseModel):
@@ -128,7 +156,9 @@ class RemapIn(BaseModel):
 def remap(body: RemapIn, authorization: str | None = Header(default=None)):
     require_user(authorization)
     now = datetime.now().isoformat(timespec="seconds")
-    with connect() as c:
+    c, writable = connect()
+    require_writable(writable)
+    with c:
         ver = c.execute("SELECT version FROM map_versions WHERE status='生效' ORDER BY id DESC LIMIT 1").fetchone()
         if not ver: raise HTTPException(404, "无生效映射版本")
         m = c.execute("SELECT * FROM mappings WHERE version=? AND old_key=?", (ver["version"], body.old_key)).fetchone()
@@ -143,14 +173,135 @@ def remap(body: RemapIn, authorization: str | None = Header(default=None)):
 @app.get("/api/formal")
 def formal(authorization: str | None = Header(default=None)):
     require_user(authorization)
-    with connect() as c:
+    c, _writable = connect()
+    with c:
         return {"items":[dict(r) for r in c.execute("SELECT * FROM formal_entities ORDER BY id DESC").fetchall()]}
 
 @app.get("/api/conflicts")
 def conflicts(authorization: str | None = Header(default=None)):
     require_user(authorization)
-    with connect() as c:
+    c, _writable = connect()
+    with c:
         return {"items":[dict(r) for r in c.execute("SELECT * FROM conflicts ORDER BY id DESC").fetchall()]}
+
+import batch_remap
+
+@app.post("/api/batch/seed")
+def batch_seed(body: batch_remap.BatchSeedIn, authorization: str | None = Header(default=None)):
+    require_user(authorization)
+    c, writable = connect()
+    require_writable(writable)
+    with c:
+        batch_remap.seed_batch(c, body)
+        return {"batch_id": body.batch_id, "total_keys": len(body.items), "limit": body.limit}
+
+@app.post("/api/batch/remap")
+def batch_remap_run(body: batch_remap.BatchRemapIn, authorization: str | None = Header(default=None)):
+    require_user(authorization)
+    c, writable = connect()
+    require_writable(writable)
+    with c:
+        try:
+            return batch_remap.run_batch_remap(c, body)
+        except HTTPException:
+            raise
+        except RuntimeError as e:
+            raise HTTPException(500, str(e))
+
+@app.get("/api/batch/cursor")
+def batch_cursor(batch_id: str, authorization: str | None = Header(default=None)):
+    require_user(authorization)
+    c, writable = connect()
+    with c:
+        if writable:
+            batch_remap.ensure_batch_tables(c)
+        row = c.execute(
+            "SELECT * FROM cursor_ledger WHERE batch_id=? ORDER BY id DESC LIMIT 1", (batch_id,)
+        ).fetchone()
+        if not row: raise HTTPException(404, "批次不存在")
+        history = [dict(r) for r in c.execute(
+            "SELECT id,last_cursor,written_at FROM cursor_ledger WHERE batch_id=? ORDER BY id",
+            (batch_id,)).fetchall()]
+        return {"batch_id": batch_id, "last_cursor": row["last_cursor"], "history": history}
+
+@app.get("/api/batch/receipt")
+def batch_receipt(batch_id: str, authorization: str | None = Header(default=None)):
+    require_user(authorization)
+    c, writable = connect()
+    with c:
+        if writable:
+            batch_remap.ensure_batch_tables(c)
+        row = c.execute("SELECT * FROM batch_receipts WHERE batch_id=?", (batch_id,)).fetchone()
+        if not row: raise HTTPException(404, "回执不存在")
+        return dict(row)
+
+@app.get("/api/batch/proof")
+def batch_proof(batch_id: str, authorization: str | None = Header(default=None)):
+    require_user(authorization)
+    c, writable = connect()
+    with c:
+        if writable:
+            batch_remap.ensure_batch_tables(c)
+        b = c.execute("SELECT * FROM remap_batches WHERE batch_id=?", (batch_id,)).fetchone()
+        if not b: raise HTTPException(404, "批次不存在")
+        pending = c.execute(
+            "SELECT COUNT(*) c FROM inbound_keys WHERE batch_id=? AND processed=0", (batch_id,)
+        ).fetchone()["c"]
+        processed = c.execute(
+            "SELECT COUNT(*) c FROM inbound_keys WHERE batch_id=? AND processed=1", (batch_id,)
+        ).fetchone()["c"]
+        last_processed_id = c.execute(
+            "SELECT MAX(id) m FROM inbound_keys WHERE batch_id=? AND processed=1", (batch_id,)
+        ).fetchone()["m"] or 0
+        formal_rows = c.execute(
+            "SELECT COUNT(*) c FROM formal_entities WHERE batch_id=?", (batch_id,)
+        ).fetchone()["c"]
+        skip_rows = c.execute(
+            "SELECT COUNT(*) c FROM skip_audit WHERE batch_id=?", (batch_id,)
+        ).fetchone()["c"]
+        ledger_max = c.execute(
+            "SELECT MAX(last_cursor) m FROM cursor_ledger WHERE batch_id=?", (batch_id,)
+        ).fetchone()["m"] or 0
+        receipt = c.execute(
+            "SELECT * FROM batch_receipts WHERE batch_id=?", (batch_id,)
+        ).fetchone()
+        contention = c.execute(
+            "SELECT COUNT(*) c FROM lock_events WHERE batch_id=? AND event='争用拒绝'", (batch_id,)
+        ).fetchone()["c"]
+        locks_held = c.execute(
+            "SELECT COUNT(*) c FROM batch_locks WHERE batch_id=?", (batch_id,)
+        ).fetchone()["c"]
+
+        # 五处同态：cursor 账 / 正式实体 / skip 审计 / 批回执 / 互证页。
+        checks = {
+            "cursor_matches_last_row": ledger_max == last_processed_id,
+            "formal_matches_processed": formal_rows == processed,
+            "skip_is_zero": skip_rows == 0,
+            "receipt_matches": (
+                receipt is not None
+                and receipt["formal_rows"] == formal_rows
+                and receipt["skip_rows"] == skip_rows
+                and receipt["expected_keys"] == b["total_keys"]
+            ),
+            "no_pending_when_done": b["status"] != "已完成" or pending == 0,
+        }
+        homomorphic = all(checks.values())
+        return {
+            "batch_id": batch_id,
+            "status": b["status"],
+            "expected_keys": b["total_keys"],
+            "pending_keys": pending,
+            "processed_keys": processed,
+            "formal_rows": formal_rows,
+            "skip_rows": skip_rows,
+            "ledger_max_cursor": ledger_max,
+            "last_processed_row_id": last_processed_id,
+            "contention_events": contention,
+            "locks_held": locks_held,
+            "homomorphic": homomorphic,
+            "checks": checks,
+            "receipt": dict(receipt) if receipt else None,
+        }
 
 @app.get("/")
 def index():

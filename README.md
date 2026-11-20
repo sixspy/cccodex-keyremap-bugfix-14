@@ -49,3 +49,17 @@ python -m pip install -r requirements.txt
 python -m uvicorn app:app --app-dir backend --host 127.0.0.1 --port 10604
 python -m pytest -q
 `
+
+## 批重映与 cursor（甲路径：强制游标）
+
+跳号修复口径见 `ops/跳号修复说明.md`（2026-11-20 锁定，甲乙互斥，本次取甲）。续跑必须携带上次 cursor，缺/错整笔拒绝（400）、正式零增；同 batch 两路推进须占批锁，后到只记争用（409）；完成旗只认应收键数。
+
+| 接口 | 方法 | 说明 |
+|----|----|----|
+| `/api/batch/seed` | POST | 入夹具批次（batch_id、limit、items） |
+| `/api/batch/remap` | POST | 单窗推进，body 须带 `resume_cursor`（首批 0） |
+| `/api/batch/cursor` | GET | cursor 账末值与历史 |
+| `/api/batch/receipt` | GET | 批回执 |
+| `/api/batch/proof` | GET | 互证页：五处同态判定（cursor 账/正式实体/skip 审计/回执/互证页） |
+
+本地夹具：`fixtures/inbound_batch.json`（SQLite，不挂外置库）。红测：`tests/test_cursor_skip.py`。

@@ -54,6 +54,7 @@ createApp({
     const leftTab=ref(0), rightTab=ref(0);
     const versions=ref([]), mappings=ref([]), formal=ref([]), conflicts=ref([]);
     const oldKey=ref('OLD-B1');
+    const batchId=ref('B-LOCAL-001'), proof=ref(null), cursorInfo=ref(null), batchErr=ref('');
     function auth(){return {Authorization:'Bearer '+token.value,'Content-Type':'application/json'};}
     async function login(){
       err.value='';
@@ -87,8 +88,17 @@ createApp({
       const j=await r.json(); actionErr.value=r.ok?('正式键 '+j.entity_key):(j.detail||'失败');
       await refresh();
     }
+    async function loadProof(){
+      batchErr.value='';
+      const p=await loadJson('/api/batch/proof?batch_id='+encodeURIComponent(batchId.value));
+      if(p===null){batchErr.value='批次不存在或未登录';proof.value=null;return;}
+      proof.value=p;
+      const cu=await loadJson('/api/batch/cursor?batch_id='+encodeURIComponent(batchId.value));
+      cursorInfo.value=cu;
+    }
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,actionErr,leftTab,rightTab,versions,mappings,formal,conflicts,oldKey,login,logout,doRemap};
+    return {token,user,username,password,err,actionErr,leftTab,rightTab,versions,mappings,formal,conflicts,
+      oldKey,batchId,proof,cursorInfo,batchErr,login,logout,doRemap,loadProof};
   },
   template:`
   <div v-if="!token" class="login">
@@ -129,6 +139,7 @@ createApp({
         <div class="tabs">
           <button :class="{on:rightTab===0}" @click="rightTab=0">正式区</button>
           <button :class="{on:rightTab===1}" @click="rightTab=1">冲突队列</button>
+          <button :class="{on:rightTab===2}" @click="rightTab=2;loadProof()">批重映互证</button>
         </div>
         <div class="box" v-show="rightTab===0">
           <h2>Formal Zone</h2>
@@ -139,6 +150,30 @@ createApp({
           <h2>Conflicts</h2>
           <table><thead><tr><th>old</th><th>reason</th><th>status</th></tr></thead>
           <tbody><tr v-for="c in conflicts" :key="c.id"><td class="bad">{{c.old_key}}</td><td>{{c.reason}}</td><td>{{c.status}}</td></tr></tbody></table>
+        </div>
+        <div class="box" v-show="rightTab===2">
+          <h2>批重映互证（五处同态，不设进度台）</h2>
+          <label>batch_id</label>
+          <input v-model="batchId" @keyup.enter="loadProof"/>
+          <button class="ghost" @click="loadProof">对账查询</button>
+          <div class="err">{{batchErr}}</div>
+          <table v-if="proof" style="margin-top:10px">
+            <tbody>
+              <tr><td>批次状态</td><td :class="proof.status==='已完成'&&proof.homomorphic?'ok':'bad'">{{proof.status}}</td></tr>
+              <tr><td>应收键数</td><td>{{proof.expected_keys}}</td></tr>
+              <tr><td>未映键</td><td :class="proof.pending_keys===0?'ok':'bad'">{{proof.pending_keys}}</td></tr>
+              <tr><td>正式实体</td><td :class="proof.formal_rows===proof.expected_keys?'ok':'bad'">{{proof.formal_rows}}</td></tr>
+              <tr><td>skip 审计（甲路径恒 0）</td><td :class="proof.skip_rows===0?'ok':'bad'">{{proof.skip_rows}}</td></tr>
+              <tr><td>cursor 账末值 / 末处理行 id</td><td :class="proof.checks.cursor_matches_last_row?'ok':'bad'">{{proof.ledger_max_cursor}} / {{proof.last_processed_row_id}}</td></tr>
+              <tr><td>争用拒绝事件</td><td>{{proof.contention_events}}</td></tr>
+              <tr><td>残留批锁</td><td :class="proof.locks_held===0?'ok':'bad'">{{proof.locks_held}}</td></tr>
+              <tr v-if="cursorInfo"><td>cursor 历史</td><td>{{cursorInfo.history.map(h=>h.last_cursor).join(' → ')}}</td></tr>
+            </tbody>
+          </table>
+          <p v-if="proof" :class="proof.homomorphic?'ok':'bad'" style="margin-top:10px;font-weight:700">
+            {{proof.homomorphic?'五处同态：账实一致，完成可信':'同态失败：存在不一致，完成旗不可信'}}
+          </p>
+          <p style="color:var(--muted);font-size:11px">口径：强制游标（甲路径），续跑须携带上次 cursor，缺/错整笔拒绝、正式零增；只改进度条判失败。</p>
         </div>
       </div>
     </div>

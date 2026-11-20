@@ -1,0 +1,16 @@
+{
+  "batch_id": "B-LOCAL-001",
+  "limit": 3,
+  "items": [
+    {"old_key": "OLD-K01", "new_key": "NEW-N01"},
+    {"old_key": "OLD-K02", "new_key": "NEW-N02"},
+    {"old_key": "OLD-K03", "new_key": "NEW-N03"},
+    {"old_key": "OLD-K04", "new_key": "NEW-N04"},
+    {"old_key": "OLD-K05", "new_key": "NEW-N05"},
+    {"old_key": "OLD-K06", "new_key": "NEW-N06"},
+    {"old_key": "OLD-K07", "new_key": "NEW-N07"},
+    {"old_key": "OLD-K08", "new_key": "NEW-N08"},
+    {"old_key": "OLD-K09", "new_key": "NEW-N09"},
+    {"old_key": "OLD-K10", "new_key": "NEW-N10"}
+  ]
+}
